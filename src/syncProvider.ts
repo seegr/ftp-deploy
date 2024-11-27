@@ -154,30 +154,41 @@ export class FTPSyncProvider implements ISyncProvider {
         this.logger.all(`Uploading: ${prettyBytes(diffs.sizeUpload)} -- Deleting: ${prettyBytes(diffs.sizeDelete)} -- Replacing: ${prettyBytes(diffs.sizeReplace)}`);
         this.logger.all(`----------------------------------------------------------------`);
 
-        // create new folders
-        for (const file of diffs.upload.filter(item => item.type === "folder")) {
-            await this.createFolder(file.name);
-        }
+        // NOOP timer
+        const noopInterval = setInterval(() => {
+            this.logger.verbose("Sending NOOP to prevent timeout...");
+            this.client.send("NOOP").catch((err) => {
+                this.logger.verbose(`Failed to send NOOP: ${err.message}`);
+            });
+        }, 30000);
 
-        // upload new files
-        for (const file of diffs.upload.filter(item => item.type === "file").filter(item => item.name !== this.stateName)) {
-            await this.uploadFile(file.name, "upload");
-        }
+        try {
+            // create new folders
+            for (const file of diffs.upload.filter(item => item.type === "folder")) {
+                await this.createFolder(file.name);
+            }
 
-        // replace new files
-        for (const file of diffs.replace.filter(item => item.type === "file").filter(item => item.name !== this.stateName)) {
-            // note: FTP will replace old files with new files. We run replacements after uploads to limit downtime
-            await this.uploadFile(file.name, "replace");
-        }
+            // upload new files
+            for (const file of diffs.upload.filter(item => item.type === "file").filter(item => item.name !== this.stateName)) {
+                await this.uploadFile(file.name, "upload");
+            }
 
-        // delete old files
-        for (const file of diffs.delete.filter(item => item.type === "file")) {
-            await this.removeFile(file.name);
-        }
+            // replace new files
+            for (const file of diffs.replace.filter(item => item.type === "file").filter(item => item.name !== this.stateName)) {
+                await this.uploadFile(file.name, "replace");
+            }
 
-        // delete old folders
-        for (const file of diffs.delete.filter(item => item.type === "folder")) {
-            await this.removeFolder(file.name);
+            // delete old files
+            for (const file of diffs.delete.filter(item => item.type === "file")) {
+                await this.removeFile(file.name);
+            }
+
+            // delete old folders
+            for (const file of diffs.delete.filter(item => item.type === "folder")) {
+                await this.removeFolder(file.name);
+            }
+        } finally {
+            clearInterval(noopInterval);
         }
 
         this.logger.all(`----------------------------------------------------------------`);
