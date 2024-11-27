@@ -46,7 +46,25 @@ export class FTPSyncProvider implements ISyncProvider {
     private serverPath: string;
     private dryRun: boolean;
     private stateName: string;
+    private lastNoopTime = Date.now();
 
+
+    private async sendNoopIfNeeded(force: boolean = false) {
+        const now = Date.now();
+        if (now - this.lastNoopTime > 5000 || force) { // 30 sekund
+            try {
+                await this.client.send("NOOP");
+                this.logger.verbose("NOOP sent to prevent timeout");
+                this.lastNoopTime = now;
+            } catch (error) {
+                if (error instanceof Error) {
+                    this.logger.verbose(`Failed to send NOOP: ${error.message}`);
+                } else {
+                    this.logger.verbose("Failed to send NOOP: Unknown error");
+                }
+            }
+        }
+    }
 
     /**
      * Converts a file path (ex: "folder/otherfolder/file.txt") to an array of folder and a file path
@@ -86,12 +104,13 @@ export class FTPSyncProvider implements ISyncProvider {
             return;
         }
 
+        await this.sendNoopIfNeeded();
+
         const path = this.getFileBreadcrumbs(folderPath + "/");
 
         if (path.folders === null) {
             this.logger.verbose(`  no need to change dir`);
-        }
-        else {
+        } else {
             await ensureDir(this.client, this.logger, this.timings, path.folders.join("/"));
         }
 
@@ -139,6 +158,8 @@ export class FTPSyncProvider implements ISyncProvider {
         const typePast = type === "upload" ? "uploaded" : "replaced";
         this.logger.all(`${typePresent} "${filePath}"`);
 
+        await this.sendNoopIfNeeded();
+
         if (this.dryRun === false) {
             await retryRequest(this.logger, async () => await this.client.uploadFrom(this.localPath + filePath, filePath));
         }
@@ -154,44 +175,33 @@ export class FTPSyncProvider implements ISyncProvider {
         this.logger.all(`Uploading: ${prettyBytes(diffs.sizeUpload)} -- Deleting: ${prettyBytes(diffs.sizeDelete)} -- Replacing: ${prettyBytes(diffs.sizeReplace)}`);
         this.logger.all(`----------------------------------------------------------------`);
 
-        // NOOP timer
-        const noopInterval = setInterval(() => {
-            this.logger.verbose("Sending NOOP to prevent timeout...");
-            this.client.send("NOOP").catch((err) => {
-                this.logger.verbose(`Failed to send NOOP: ${err.message}`);
-            });
-        }, 30000);
+        // create new folders
+        for (const file of diffs.upload.filter(item => item.type === "folder")) {
+            await this.createFolder(file.name);
+        }
 
-        try {
-            // create new folders
-            for (const file of diffs.upload.filter(item => item.type === "folder")) {
-                await this.createFolder(file.name);
-            }
+        // upload new files
+        for (const file of diffs.upload.filter(item => item.type === "file").filter(item => item.name !== this.stateName)) {
+            await this.uploadFile(file.name, "upload");
+        }
 
-            // upload new files
-            for (const file of diffs.upload.filter(item => item.type === "file").filter(item => item.name !== this.stateName)) {
-                await this.uploadFile(file.name, "upload");
-            }
+        // replace new files
+        for (const file of diffs.replace.filter(item => item.type === "file").filter(item => item.name !== this.stateName)) {
+            await this.uploadFile(file.name, "replace");
+        }
 
-            // replace new files
-            for (const file of diffs.replace.filter(item => item.type === "file").filter(item => item.name !== this.stateName)) {
-                await this.uploadFile(file.name, "replace");
-            }
+        // delete old files
+        for (const file of diffs.delete.filter(item => item.type === "file")) {
+            await this.removeFile(file.name);
+        }
 
-            // delete old files
-            for (const file of diffs.delete.filter(item => item.type === "file")) {
-                await this.removeFile(file.name);
-            }
-
-            // delete old folders
-            for (const file of diffs.delete.filter(item => item.type === "folder")) {
-                await this.removeFolder(file.name);
-            }
-        } finally {
-            clearInterval(noopInterval);
+        // delete old folders
+        for (const file of diffs.delete.filter(item => item.type === "folder")) {
+            await this.removeFolder(file.name);
         }
 
         this.logger.all(`----------------------------------------------------------------`);
+        this.logger.all(`A je to tam! 💩`);
         this.logger.all(`🎉 Sync complete. Saving current server state to "${this.serverPath + this.stateName}"`);
         if (this.dryRun === false) {
             await retryRequest(this.logger, async () => await this.client.uploadFrom(this.localPath + this.stateName, this.stateName));
