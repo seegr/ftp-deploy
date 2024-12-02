@@ -136,7 +136,6 @@ export async function deploy(args: IFtpDeployArgumentsWithDefaults, logger: ILog
         timings.stop("connecting");
     }
 
-
     let totalBytesUploaded = 0;
     try {
         await global.reconnect();
@@ -153,35 +152,49 @@ export async function deploy(args: IFtpDeployArgumentsWithDefaults, logger: ILog
         logger.standard(`Calculating differences between client & server`);
         logger.standard(`----------------------------------------------------------------`);
 
+        await global.reconnect();
+
         const diffs = diffTool.getDiffs(localFiles, serverFiles);
 
         diffs.upload.filter((itemUpload) => itemUpload.type === "folder").map((itemUpload) => {
             logger.standard(`📁 Create: ${itemUpload.name}`);
         });
 
+        await global.reconnect();
+
         diffs.upload.filter((itemUpload) => itemUpload.type === "file").map((itemUpload) => {
             logger.standard(`📄 Upload: ${itemUpload.name}`);
         });
+
+        await global.reconnect();
 
         diffs.replace.map((itemReplace) => {
             logger.standard(`🔁 File replace: ${itemReplace.name}`);
         });
 
+        await global.reconnect();
+
         diffs.delete.filter((itemUpload) => itemUpload.type === "file").map((itemDelete) => {
             logger.standard(`📄 Delete: ${itemDelete.name}    `);
         });
 
+        await global.reconnect();
+
         diffs.delete.filter((itemUpload) => itemUpload.type === "folder").map((itemDelete) => {
             logger.standard(`📁 Delete: ${itemDelete.name}    `);
         });
+
+        await global.reconnect();
 
         diffs.same.map((itemSame) => {
             if (itemSame.type === "file") {
                 logger.standard(`⚖️  File content is the same, doing nothing: ${itemSame.name}`);
             }
         });
-        timings.stop("logging");
 
+        await global.reconnect();
+
+        timings.stop("logging");
 
         totalBytesUploaded = diffs.sizeUpload + diffs.sizeReplace;
 

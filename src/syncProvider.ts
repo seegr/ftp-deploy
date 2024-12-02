@@ -51,10 +51,10 @@ export class FTPSyncProvider implements ISyncProvider {
 
     private async sendNoopIfNeeded(force: boolean = false) {
         const now = Date.now();
-        if (now - this.lastNoopTime > 5000 || force) { // 30 sekund
+        if (now - this.lastNoopTime > 5000 || force) {
             try {
                 await this.client.send("NOOP");
-                this.logger.verbose("NOOP sent to prevent timeout");
+                this.logger.all("{Hey Mr. FTP ... I'm still here!!!} - 💩👉🏻 ");
                 this.lastNoopTime = now;
             } catch (error) {
                 if (error instanceof Error) {
