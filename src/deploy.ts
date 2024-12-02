@@ -33,8 +33,7 @@ async function connect(client: ftp.Client, args: IFtpDeployArgumentsWithDefaults
     let secure: boolean | "implicit" = false;
     if (args.protocol === "ftps") {
         secure = true;
-    }
-    else if (args.protocol === "ftps-legacy") {
+    } else if (args.protocol === "ftps-legacy") {
         secure = "implicit";
     }
 
@@ -43,6 +42,7 @@ async function connect(client: ftp.Client, args: IFtpDeployArgumentsWithDefaults
     const rejectUnauthorized = args.security === "strict";
 
     try {
+        logger.verbose(`Attempting connection to ${args.server}:${args.port} via ${args.protocol}`);
         await client.access({
             host: args.server,
             user: args.username,
@@ -53,15 +53,16 @@ async function connect(client: ftp.Client, args: IFtpDeployArgumentsWithDefaults
                 rejectUnauthorized: rejectUnauthorized
             }
         });
-    }
-    catch (error) {
-        logger.all("Failed to connect, are you sure your server works via FTP or FTPS? Users sometimes get this error when the server only supports SFTP.");
+        logger.verbose("FTP connection successful.");
+    } catch (error: any) {
+        logger.all("Connection failed. Ensure the server supports the chosen protocol (FTP/FTPS).");
+        logger.verbose(`Connection error: ${error.message}`);
         throw error;
     }
 
     if (args["log-level"] === "verbose") {
         client.trackProgress(info => {
-            logger.verbose(`${info.type} progress for "${info.name}". Progress: ${info.bytes} bytes of ${info.bytesOverall} bytes`);
+            logger.verbose(`${info.type} progress for "${info.name}". Progress: ${info.bytes} of ${info.bytesOverall} bytes`);
         });
     }
 }
@@ -112,7 +113,6 @@ export async function getServerFiles(client: ftp.Client, logger: ILogger, timing
 export async function deploy(args: IFtpDeployArgumentsWithDefaults, logger: ILogger, timings: ITimings): Promise<void> {
     timings.start("total");
 
-    // header
     logger.all(`----------------------------------------------------------------`);
     logger.all(`🚀 Thanks for using ftp-deploy. Let's deploy some stuff!   `);
     logger.all(`Nazdárek 💩 ... (Thank you Sam!)   `);
@@ -130,11 +130,21 @@ export async function deploy(args: IFtpDeployArgumentsWithDefaults, logger: ILog
 
     const client = new ftp.Client(args.timeout);
 
+    // Keep-alive mechanism
+    const keepAliveInterval = setInterval(async () => {
+        try {
+            await client.send("NOOP"); // Prevents timeout by sending a "No Operation" command
+        } catch (error) {
+            logger.all("{Hey Mr. FTP ... I'm still here!!!} - 💩👉🏻 ");
+            await global.reconnect(); // Reconnect if keep-alive fails
+        }
+    }, 3000); // Keep-alive interval: half the timeout duration
+
     global.reconnect = async function () {
         timings.start("connecting");
         await connect(client, args, logger);
         timings.stop("connecting");
-    }
+    };
 
     let totalBytesUploaded = 0;
     try {
@@ -152,47 +162,33 @@ export async function deploy(args: IFtpDeployArgumentsWithDefaults, logger: ILog
         logger.standard(`Calculating differences between client & server`);
         logger.standard(`----------------------------------------------------------------`);
 
-        await global.reconnect();
-
         const diffs = diffTool.getDiffs(localFiles, serverFiles);
 
         diffs.upload.filter((itemUpload) => itemUpload.type === "folder").map((itemUpload) => {
             logger.standard(`📁 Create: ${itemUpload.name}`);
         });
 
-        await global.reconnect();
-
         diffs.upload.filter((itemUpload) => itemUpload.type === "file").map((itemUpload) => {
             logger.standard(`📄 Upload: ${itemUpload.name}`);
         });
-
-        await global.reconnect();
 
         diffs.replace.map((itemReplace) => {
             logger.standard(`🔁 File replace: ${itemReplace.name}`);
         });
 
-        await global.reconnect();
-
         diffs.delete.filter((itemUpload) => itemUpload.type === "file").map((itemDelete) => {
             logger.standard(`📄 Delete: ${itemDelete.name}    `);
         });
 
-        await global.reconnect();
-
         diffs.delete.filter((itemUpload) => itemUpload.type === "folder").map((itemDelete) => {
             logger.standard(`📁 Delete: ${itemDelete.name}    `);
         });
-
-        await global.reconnect();
 
         diffs.same.map((itemSame) => {
             if (itemSame.type === "file") {
                 logger.standard(`⚖️  File content is the same, doing nothing: ${itemSame.name}`);
             }
         });
-
-        await global.reconnect();
 
         timings.stop("logging");
 
@@ -202,24 +198,21 @@ export async function deploy(args: IFtpDeployArgumentsWithDefaults, logger: ILog
         try {
             const syncProvider = new FTPSyncProvider(client, logger, timings, args["local-dir"], args["server-dir"], args["state-name"], args["dry-run"]);
             await syncProvider.syncLocalToServer(diffs);
-        }
-        finally {
+        } finally {
             timings.stop("upload");
         }
-    }
-    catch (error) {
+    } catch (error) {
         prettyError(logger, args, error);
         throw error;
-    }
-    finally {
+    } finally {
+        clearInterval(keepAliveInterval); // Stop the keep-alive timer
         client.close();
         timings.stop("total");
     }
 
-
     const uploadSpeed = prettyBytes(totalBytesUploaded / (timings.getTime("upload") / 1000));
 
-    // footer
+    // Footer
     logger.all(`----------------------------------------------------------------`);
     logger.all(`Time spent hashing: ${timings.getTimeFormatted("hash")}`);
     logger.all(`Time spent connecting to server: ${timings.getTimeFormatted("connecting")}`);
