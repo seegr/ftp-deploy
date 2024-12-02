@@ -1,6 +1,6 @@
 {
   "name": "@seegr/ftp-deploy",
-  "version": "1.0.5",
+  "version": "1.0.6",
   "private": false,
   "description": "Deploy files to a ftp server",
   "main": "dist/module.js",
