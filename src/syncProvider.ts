@@ -80,7 +80,10 @@ export class FTPSyncProvider implements ISyncProvider {
             host: this.server,
             user: this.username,
             password: this.password,
-            secure: true, // nebo podle potřeby
+            secure: true,
+            secureOptions: {
+                rejectUnauthorized: false,
+            },
         });
         this.logger.verbose("Reconnected successfully.");
     }
