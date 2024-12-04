@@ -2,8 +2,9 @@ import prettyBytes from "pretty-bytes";
 import type * as ftp from "basic-ftp";
 import * as basicFtp from "basic-ftp";
 import fs from "fs";
-import {DiffResult, ErrorCode, IFilePath, currentSyncFileVersion} from "./types";
+import {DiffResult, ErrorCode, IFilePath, IFileList, currentSyncFileVersion, Record} from "./types";
 import { ILogger, pluralize, retryRequest, ITimings } from "./utilities";
+import { createLocalState } from "./deploy";
 
 export async function ensureDir(client: ftp.Client, logger: ILogger, timings: ITimings, folder: string): Promise<void> {
     timings.start("changingDir");
@@ -31,6 +32,8 @@ interface ISyncProvider {
 }
 
 export class FTPSyncProvider implements ISyncProvider {
+    private state: IFileList;
+
     constructor(
       client: ftp.Client,
       logger: ILogger,
@@ -53,6 +56,22 @@ export class FTPSyncProvider implements ISyncProvider {
         this.server = server;
         this.username = username;
         this.password = password;
+
+        // Inicializace state ze souboru
+        const stateFilePath = `${this.localPath}${this.stateName}`;
+        if (fs.existsSync(stateFilePath)) {
+            const stateFileContent = fs.readFileSync(stateFilePath, "utf-8");
+            this.state = JSON.parse(stateFileContent) as IFileList;
+            this.logger.verbose("State loaded from file.");
+        } else {
+            this.state = {
+                description: "Sync state file",
+                version: "1.0.0",
+                generatedTime: new Date().getTime(),
+                data: [],
+            };
+            this.logger.verbose("Initialized new empty state.");
+        }
     }
 
     private client: ftp.Client;
@@ -105,22 +124,26 @@ export class FTPSyncProvider implements ISyncProvider {
         }
     }
 
-    private async safeOperation(operation: any, retries = 3): Promise<any> {
+    private async safeOperation(operation: () => Promise<any>, retries = 3): Promise<any> {
         let lastError: Error | null = null;
 
         for (let attempt = 0; attempt < retries; attempt++) {
             try {
                 return await operation();
-            } catch (error) {
+            } catch (error: any) {
                 if (error instanceof Error) {
                     lastError = error;
 
-                    if (error.message.includes("Client is closed")) {
-                        this.logger.verbose("Client closed, attempting to reconnect...");
+                    if (
+                      error.message.includes("Client is closed") ||
+                      error.message.includes("Server sent FIN packet")
+                    ) {
+                        this.logger.verbose(`Connection issue detected: ${error.message}`);
+                        this.logger.verbose("Attempting to reconnect...");
                         await this.reconnect();
+                    } else {
+                        console.error(`Operation failed (attempt ${attempt + 1}/${retries}): ${error.message}`);
                     }
-
-                    console.error(`Operation failed (attempt ${attempt + 1}/${retries}): ${error.message}`);
                 } else {
                     lastError = new Error("Unknown error occurred");
                     console.error(`Operation failed (attempt ${attempt + 1}/${retries}): Unknown error`);
@@ -202,22 +225,18 @@ export class FTPSyncProvider implements ISyncProvider {
             );
         }
 
-        // Update state.json after successful operation
-        const diffs: DiffResult = {
-            upload: [{ type: "folder", name: folderPath, size: undefined }],
-            delete: [],
-            replace: [],
-            same: [],
-            sizeUpload: 0,
-            sizeDelete: 0,
-            sizeReplace: 0,
-        };
-        await this.updateStateFile(this.localPath, this.stateName, diffs);
-
         // navigate back to the root folder
         await this.upDir(path.folders?.length);
 
         this.logger.verbose(`  completed`);
+
+        // Záznam do průběžného stavu
+        const newEntry: Record = { type: "folder", name: folderPath, size: undefined };
+        this.state.data.push(newEntry); // Přidání do stavu
+        createLocalState(this.state, this.logger, {
+            "local-dir": this.localPath,
+            "state-name": this.stateName,
+        } as any); // Uložení stavu do souboru
     }
 
     async removeFile(filePath: string) {
@@ -277,38 +296,84 @@ export class FTPSyncProvider implements ISyncProvider {
         this.logger.all(`Uploading: ${prettyBytes(diffs.sizeUpload)} -- Deleting: ${prettyBytes(diffs.sizeDelete)} -- Replacing: ${prettyBytes(diffs.sizeReplace)}`);
         this.logger.all(`----------------------------------------------------------------`);
 
-        try {
-            // create new folders
-            for (const file of diffs.upload.filter(item => item.type === "folder")) {
-                await this.createFolder(file.name);
-            }
 
-            // upload new files
-            for (const file of diffs.upload.filter(item => item.type === "file").filter(item => item.name !== this.stateName)) {
-                await this.uploadFile(file.name, "upload");
+        let operationsCount = 0;
+        const flushState = async () => {
+            // Nahrání průběžného stavu na FTP
+            if (!this.dryRun) {
+                try {
+                    await this.safeOperation(async () =>
+                      this.client.uploadFrom(
+                        `${this.localPath}${this.stateName}`, // Lokální cesta
+                        `${this.serverPath}${this.stateName}` // Cílová cesta
+                      )
+                    );
+                    this.logger.verbose(`State file "${this.stateName}" uploaded to the server after ${operationsCount} operations.`);
+                } catch (error: any) {
+                    this.logger.all(`⚠️ Failed to upload state file: ${error.message}`);
+                }
             }
+        };
 
-            // replace new files
-            for (const file of diffs.replace.filter(item => item.type === "file").filter(item => item.name !== this.stateName)) {
-                await this.uploadFile(file.name, "replace");
+        // Create new folders
+        for (const file of diffs.upload.filter(item => item.type === "folder")) {
+            this.logger.standard(`📁 Creating folder: ${file.name}`);
+            await this.createFolder(file.name);
+            operationsCount++;
+
+            if (operationsCount % 5 === 0) {
+                await flushState();
             }
-
-            // delete old files
-            for (const file of diffs.delete.filter(item => item.type === "file")) {
-                await this.removeFile(file.name);
-            }
-
-            // delete old folders
-            for (const file of diffs.delete.filter(item => item.type === "folder")) {
-                await this.removeFolder(file.name);
-            }
-
-            this.logger.all(`----------------------------------------------------------------`);
-            this.logger.all(`🎉 Sync complete.`);
-        } catch (error: any) {
-            this.logger.all(`⚠️ Sync interrupted due to an error: ${error.message}`);
-            await this.updateStateFile(this.localPath, this.stateName, diffs); // Uložíme aktuální stav
-            throw error;
         }
+
+        // Upload new files
+        for (const file of diffs.upload.filter(item => item.type === "file").filter(item => item.name !== this.stateName)) {
+            this.logger.standard(`📄 Uploading new file: ${file.name}`);
+            await this.uploadFile(file.name, "upload");
+            operationsCount++;
+
+            if (operationsCount % 5 === 0) {
+                await flushState();
+            }
+        }
+
+        // Replace files
+        for (const file of diffs.replace.filter(item => item.type === "file").filter(item => item.name !== this.stateName)) {
+            this.logger.standard(`🔁 Replacing file: ${file.name}`);
+            await this.uploadFile(file.name, "replace");
+            operationsCount++;
+
+            if (operationsCount % 5 === 0) {
+                await flushState();
+            }
+        }
+
+        // Delete old files
+        for (const file of diffs.delete.filter(item => item.type === "file")) {
+            this.logger.standard(`📄 Deleting file: ${file.name}`);
+            await this.removeFile(file.name);
+            operationsCount++;
+
+            if (operationsCount % 5 === 0) {
+                await flushState();
+            }
+        }
+
+        // Delete old folders
+        for (const file of diffs.delete.filter(item => item.type === "folder")) {
+            this.logger.standard(`📁 Deleting folder: ${file.name}`);
+            await this.removeFolder(file.name);
+            operationsCount++;
+
+            if (operationsCount % 5 === 0) {
+                await flushState();
+            }
+        }
+
+        this.logger.all(`----------------------------------------------------------------`);
+        this.logger.all(`A je to tam! 💩`);
+        this.logger.all(`🎉 Sync complete. Saving current server state to "${this.serverPath + this.stateName}"`);
+
+        await flushState();
     }
 }

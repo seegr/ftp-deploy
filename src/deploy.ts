@@ -23,7 +23,7 @@ async function downloadFileList(client: ftp.Client, logger: ILogger, path: strin
     return fileAsObject;
 }
 
-function createLocalState(localFiles: IFileList, logger: ILogger, args: IFtpDeployArgumentsWithDefaults): void {
+export function createLocalState(localFiles: IFileList, logger: ILogger, args: IFtpDeployArgumentsWithDefaults): void {
     logger.verbose(`Creating local state at ${args["local-dir"]}${args["state-name"]}`);
     fs.writeFileSync(`${args["local-dir"]}${args["state-name"]}`, JSON.stringify(localFiles, undefined, 4), { encoding: "utf8" });
     logger.verbose("Local state created");
