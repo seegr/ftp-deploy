@@ -51,7 +51,7 @@ async function connect(client: ftp.Client, args: IFtpDeployArgumentsWithDefaults
             secure: secure,
             secureOptions: {
                 rejectUnauthorized: rejectUnauthorized
-            }
+            },
         });
         logger.verbose("FTP connection successful.");
     } catch (error: any) {
@@ -110,12 +110,53 @@ export async function getServerFiles(client: ftp.Client, logger: ILogger, timing
     }
 }
 
+async function ensureStateFileExists(
+  client: ftp.Client,
+  logger: ILogger,
+  timings: ITimings,
+  localPath: string,
+  serverPath: string,
+  stateName: string
+) {
+    const serverStatePath = `${serverPath}${stateName}`;
+    logger.all(`Ensuring state file "${serverStatePath}" exists on the server.`);
+
+    try {
+        // Check if state file exists
+        const files = await client.list(serverPath);
+        const stateFileExists = files.some(file => file.name === stateName);
+
+        if (!stateFileExists) {
+            logger.standard(`State file "${serverStatePath}" does not exist. Creating it...`);
+
+            // **ZDE přidáme inicializaci prázdného state.json**
+            const initialState: IFileList = {
+                description: syncFileDescription,
+                version: currentSyncFileVersion,
+                generatedTime: new Date().getTime(),
+                data: [],
+            };
+            createLocalState(initialState, logger, { "local-dir": localPath, "state-name": stateName } as IFtpDeployArgumentsWithDefaults);
+
+            // Upload empty state file to the server
+            const localStateFilePath = `${localPath}${stateName}`;
+            await client.uploadFrom(localStateFilePath, serverStatePath);
+            logger.standard(`State file "${serverStatePath}" has been created on the server.`);
+        } else {
+            logger.standard(`State file "${serverStatePath}" already exists.`);
+        }
+    } catch (error: any) {
+        logger.all(`Error ensuring state file exists: ${error.message}`);
+        throw error;
+    }
+}
+
 export async function deploy(args: IFtpDeployArgumentsWithDefaults, logger: ILogger, timings: ITimings): Promise<void> {
     timings.start("total");
 
     logger.all(`----------------------------------------------------------------`);
-    logger.all(`🚀 Thanks for using ftp-deploy. Let's deploy some stuff!   `);
-    logger.all(`Nazdárek 💩 ... (Thank you Sam!)   `);
+    logger.all(`🚀 Thanks for using ftp-deploy. Let's deploy some stuff!`);
+    logger.all(`Nazdárek 💩 ... (Thank you Sam!)`);
     logger.all(`----------------------------------------------------------------`);
     logger.all(`If you found this project helpful, please support it`);
     logger.all(`by giving it a ⭐ on Github --> https://github.com/SamKirkland/FTP-Deploy-Action`);
@@ -129,16 +170,9 @@ export async function deploy(args: IFtpDeployArgumentsWithDefaults, logger: ILog
     createLocalState(localFiles, logger, args);
 
     const client = new ftp.Client(args.timeout);
-
-    // Keep-alive mechanism
-    const keepAliveInterval = setInterval(async () => {
-        try {
-            await client.send("NOOP"); // Prevents timeout by sending a "No Operation" command
-        } catch (error) {
-            logger.all("{Hey Mr. FTP ... I'm still here!!!} - 💩👉🏻 ");
-            await global.reconnect(); // Reconnect if keep-alive fails
-        }
-    }, 3000); // Keep-alive interval: half the timeout duration
+    const stateName = args["state-name"];
+    const localPath = args["local-dir"];
+    const serverPath = args["server-dir"];
 
     global.reconnect = async function () {
         timings.start("connecting");
@@ -147,11 +181,17 @@ export async function deploy(args: IFtpDeployArgumentsWithDefaults, logger: ILog
     };
 
     let totalBytesUploaded = 0;
+
     try {
         await global.reconnect();
 
+        // Ensure state.json exists
+        await ensureStateFileExists(client, logger, timings, localPath, serverPath, stateName);
+
+        // Get server files
         const serverFiles = await getServerFiles(client, logger, timings, args);
 
+        // Calculate diffs
         timings.start("logging");
         const diffTool: IDiff = new HashDiff();
 
@@ -164,29 +204,29 @@ export async function deploy(args: IFtpDeployArgumentsWithDefaults, logger: ILog
 
         const diffs = diffTool.getDiffs(localFiles, serverFiles);
 
-        diffs.upload.filter((itemUpload) => itemUpload.type === "folder").map((itemUpload) => {
-            logger.standard(`📁 Create: ${itemUpload.name}`);
+        diffs.upload.filter(item => item.type === "folder").map(item => {
+            logger.standard(`📁 Create: ${item.name}`);
         });
 
-        diffs.upload.filter((itemUpload) => itemUpload.type === "file").map((itemUpload) => {
-            logger.standard(`📄 Upload: ${itemUpload.name}`);
+        diffs.upload.filter(item => item.type === "file").map(item => {
+            logger.standard(`📄 Upload: ${item.name}`);
         });
 
-        diffs.replace.map((itemReplace) => {
-            logger.standard(`🔁 File replace: ${itemReplace.name}`);
+        diffs.replace.map(item => {
+            logger.standard(`🔁 File replace: ${item.name}`);
         });
 
-        diffs.delete.filter((itemUpload) => itemUpload.type === "file").map((itemDelete) => {
-            logger.standard(`📄 Delete: ${itemDelete.name}    `);
+        diffs.delete.filter(item => item.type === "file").map(item => {
+            logger.standard(`📄 Delete: ${item.name}`);
         });
 
-        diffs.delete.filter((itemUpload) => itemUpload.type === "folder").map((itemDelete) => {
-            logger.standard(`📁 Delete: ${itemDelete.name}    `);
+        diffs.delete.filter(item => item.type === "folder").map(item => {
+            logger.standard(`📁 Delete: ${item.name}`);
         });
 
-        diffs.same.map((itemSame) => {
-            if (itemSame.type === "file") {
-                logger.standard(`⚖️  File content is the same, doing nothing: ${itemSame.name}`);
+        diffs.same.map(item => {
+            if (item.type === "file") {
+                logger.standard(`⚖️  File content is the same, doing nothing: ${item.name}`);
             }
         });
 
@@ -194,9 +234,21 @@ export async function deploy(args: IFtpDeployArgumentsWithDefaults, logger: ILog
 
         totalBytesUploaded = diffs.sizeUpload + diffs.sizeReplace;
 
+        // Upload files
         timings.start("upload");
         try {
-            const syncProvider = new FTPSyncProvider(client, logger, timings, args["local-dir"], args["server-dir"], args["state-name"], args["dry-run"]);
+            const syncProvider = new FTPSyncProvider(
+              client,
+              logger,
+              timings,
+              localPath,
+              serverPath,
+              stateName,
+              args["dry-run"],
+              args.server, // Přidáme server
+              args.username, // Přidáme username
+              args.password // Přidáme password
+            );
             await syncProvider.syncLocalToServer(diffs);
         } finally {
             timings.stop("upload");
@@ -205,14 +257,12 @@ export async function deploy(args: IFtpDeployArgumentsWithDefaults, logger: ILog
         prettyError(logger, args, error);
         throw error;
     } finally {
-        clearInterval(keepAliveInterval); // Stop the keep-alive timer
         client.close();
         timings.stop("total");
     }
 
     const uploadSpeed = prettyBytes(totalBytesUploaded / (timings.getTime("upload") / 1000));
 
-    // Footer
     logger.all(`----------------------------------------------------------------`);
     logger.all(`Time spent hashing: ${timings.getTimeFormatted("hash")}`);
     logger.all(`Time spent connecting to server: ${timings.getTimeFormatted("connecting")}`);

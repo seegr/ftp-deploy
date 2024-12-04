@@ -1,6 +1,8 @@
 import prettyBytes from "pretty-bytes";
 import type * as ftp from "basic-ftp";
-import { DiffResult, ErrorCode, IFilePath } from "./types";
+import * as basicFtp from "basic-ftp";
+import fs from "fs";
+import {DiffResult, ErrorCode, IFilePath, currentSyncFileVersion} from "./types";
 import { ILogger, pluralize, retryRequest, ITimings } from "./utilities";
 
 export async function ensureDir(client: ftp.Client, logger: ILogger, timings: ITimings, folder: string): Promise<void> {
@@ -29,7 +31,18 @@ interface ISyncProvider {
 }
 
 export class FTPSyncProvider implements ISyncProvider {
-    constructor(client: ftp.Client, logger: ILogger, timings: ITimings, localPath: string, serverPath: string, stateName: string, dryRun: boolean) {
+    constructor(
+      client: ftp.Client,
+      logger: ILogger,
+      timings: ITimings,
+      localPath: string,
+      serverPath: string,
+      stateName: string,
+      dryRun: boolean,
+      server: string,
+      username: string,
+      password: string
+    ) {
         this.client = client;
         this.logger = logger;
         this.timings = timings;
@@ -37,6 +50,9 @@ export class FTPSyncProvider implements ISyncProvider {
         this.serverPath = serverPath;
         this.stateName = stateName;
         this.dryRun = dryRun;
+        this.server = server;
+        this.username = username;
+        this.password = password;
     }
 
     private client: ftp.Client;
@@ -45,11 +61,31 @@ export class FTPSyncProvider implements ISyncProvider {
     private localPath: string;
     private serverPath: string;
     private dryRun: boolean;
+    private server: string;
+    private username: string;
+    private password: string;
     private stateName: string;
     private lastNoopTime = Date.now();
 
+    private async reconnect() {
+        this.logger.verbose("Reconnecting to FTP server...");
+        try {
+            this.client.close(); // Zavři staré připojení
+        } catch (error: any) {
+            this.logger.verbose(`Error while closing client (ignored): ${error.message}`);
+        }
 
-    private async sendNoopIfNeeded(force: boolean = false) {
+        this.client = new basicFtp.Client(this.client.ftp.timeout); // Vytvoř nový klient
+        await this.client.access({
+            host: this.server,
+            user: this.username,
+            password: this.password,
+            secure: true, // nebo podle potřeby
+        });
+        this.logger.verbose("Reconnected successfully.");
+    }
+
+    private async sendNoopIfNeeded(force = false) {
         const now = Date.now();
         if (now - this.lastNoopTime > 5000 || force) {
             try {
@@ -64,6 +100,53 @@ export class FTPSyncProvider implements ISyncProvider {
                 }
             }
         }
+    }
+
+    private async safeOperation(operation: any, retries = 3): Promise<any> {
+        let lastError: Error | null = null;
+
+        for (let attempt = 0; attempt < retries; attempt++) {
+            try {
+                return await operation();
+            } catch (error) {
+                if (error instanceof Error) {
+                    lastError = error;
+
+                    if (error.message.includes("Client is closed")) {
+                        this.logger.verbose("Client closed, attempting to reconnect...");
+                        await this.reconnect();
+                    }
+
+                    console.error(`Operation failed (attempt ${attempt + 1}/${retries}): ${error.message}`);
+                } else {
+                    lastError = new Error("Unknown error occurred");
+                    console.error(`Operation failed (attempt ${attempt + 1}/${retries}): Unknown error`);
+                }
+
+                if (attempt < retries - 1) {
+                    console.log("Retrying...");
+                }
+            }
+        }
+
+        throw new Error(`Operation failed after ${retries} attempts: ${lastError?.message}`);
+    }
+
+    private async updateStateFile(localPath: string, stateName: string, diffs: DiffResult): Promise<void> {
+        const stateFilePath = `${localPath}${stateName}`;
+        const stateData = {
+            description: "Updated state after partial sync",
+            version: currentSyncFileVersion,
+            generatedTime: new Date().getTime(),
+            data: [
+                ...diffs.upload.map(file => ({ ...file, action: "upload" })),
+                ...diffs.delete.map(file => ({ ...file, action: "delete" })),
+                ...diffs.replace.map(file => ({ ...file, action: "replace" })),
+            ],
+        };
+
+        fs.writeFileSync(stateFilePath, JSON.stringify(stateData, null, 4), { encoding: "utf8" });
+        this.logger.verbose(`State file updated at "${stateFilePath}"`);
     }
 
     /**
@@ -111,8 +194,22 @@ export class FTPSyncProvider implements ISyncProvider {
         if (path.folders === null) {
             this.logger.verbose(`  no need to change dir`);
         } else {
-            await ensureDir(this.client, this.logger, this.timings, path.folders.join("/"));
+            await this.safeOperation(async () =>
+              ensureDir(this.client, this.logger, this.timings, path.folders!.join("/"))
+            );
         }
+
+        // Update state.json after successful operation
+        const diffs: DiffResult = {
+            upload: [{ type: "folder", name: folderPath, size: undefined }],
+            delete: [],
+            replace: [],
+            same: [],
+            sizeUpload: 0,
+            sizeDelete: 0,
+            sizeReplace: 0,
+        };
+        await this.updateStateFile(this.localPath, this.stateName, diffs);
 
         // navigate back to the root folder
         await this.upDir(path.folders?.length);
@@ -125,29 +222,29 @@ export class FTPSyncProvider implements ISyncProvider {
 
         if (this.dryRun === false) {
             try {
-                await retryRequest(this.logger, async () => await this.client.remove(filePath));
-            }
-            catch (e: any) {
-                // this error is common when a file was deleted on the server directly
+                await this.safeOperation(async () => this.client.remove(filePath));
+            } catch (e: any) {
                 if (e.code === ErrorCode.FileNotFoundOrNoAccess) {
                     this.logger.standard("File not found or you don't have access to the file - skipping...");
-                }
-                else {
+                } else {
                     throw e;
                 }
             }
         }
-        this.logger.verbose(`  file removed`);
 
+        this.logger.verbose(`  file removed`);
         this.logger.verbose(`  completed`);
     }
 
-    async removeFolder(folderPath: string) {
+    async removeFolder(folderPath: any) {
+        // eslint-disable-next-line @typescript-eslint/restrict-plus-operands
         const absoluteFolderPath = "/" + (this.serverPath.startsWith("./") ? this.serverPath.replace("./", "") : this.serverPath) + folderPath;
         this.logger.all(`removing folder "${absoluteFolderPath}"`);
 
         if (this.dryRun === false) {
-            await retryRequest(this.logger, async () => await this.client.removeDir(absoluteFolderPath));
+            await this.safeOperation(async () =>
+              retryRequest(this.logger, async () => await this.client.removeDir(absoluteFolderPath))
+            );
         }
 
         this.logger.verbose(`  completed`);
@@ -161,7 +258,9 @@ export class FTPSyncProvider implements ISyncProvider {
         await this.sendNoopIfNeeded();
 
         if (this.dryRun === false) {
-            await retryRequest(this.logger, async () => await this.client.uploadFrom(this.localPath + filePath, filePath));
+            await this.safeOperation(async () =>
+              this.client.uploadFrom(this.localPath + filePath, filePath)
+            );
         }
 
         this.logger.verbose(`  file ${typePast}`);
@@ -175,36 +274,38 @@ export class FTPSyncProvider implements ISyncProvider {
         this.logger.all(`Uploading: ${prettyBytes(diffs.sizeUpload)} -- Deleting: ${prettyBytes(diffs.sizeDelete)} -- Replacing: ${prettyBytes(diffs.sizeReplace)}`);
         this.logger.all(`----------------------------------------------------------------`);
 
-        // create new folders
-        for (const file of diffs.upload.filter(item => item.type === "folder")) {
-            await this.createFolder(file.name);
-        }
+        try {
+            // create new folders
+            for (const file of diffs.upload.filter(item => item.type === "folder")) {
+                await this.createFolder(file.name);
+            }
 
-        // upload new files
-        for (const file of diffs.upload.filter(item => item.type === "file").filter(item => item.name !== this.stateName)) {
-            await this.uploadFile(file.name, "upload");
-        }
+            // upload new files
+            for (const file of diffs.upload.filter(item => item.type === "file").filter(item => item.name !== this.stateName)) {
+                await this.uploadFile(file.name, "upload");
+            }
 
-        // replace new files
-        for (const file of diffs.replace.filter(item => item.type === "file").filter(item => item.name !== this.stateName)) {
-            await this.uploadFile(file.name, "replace");
-        }
+            // replace new files
+            for (const file of diffs.replace.filter(item => item.type === "file").filter(item => item.name !== this.stateName)) {
+                await this.uploadFile(file.name, "replace");
+            }
 
-        // delete old files
-        for (const file of diffs.delete.filter(item => item.type === "file")) {
-            await this.removeFile(file.name);
-        }
+            // delete old files
+            for (const file of diffs.delete.filter(item => item.type === "file")) {
+                await this.removeFile(file.name);
+            }
 
-        // delete old folders
-        for (const file of diffs.delete.filter(item => item.type === "folder")) {
-            await this.removeFolder(file.name);
-        }
+            // delete old folders
+            for (const file of diffs.delete.filter(item => item.type === "folder")) {
+                await this.removeFolder(file.name);
+            }
 
-        this.logger.all(`----------------------------------------------------------------`);
-        this.logger.all(`A je to tam! 💩`);
-        this.logger.all(`🎉 Sync complete. Saving current server state to "${this.serverPath + this.stateName}"`);
-        if (this.dryRun === false) {
-            await retryRequest(this.logger, async () => await this.client.uploadFrom(this.localPath + this.stateName, this.stateName));
+            this.logger.all(`----------------------------------------------------------------`);
+            this.logger.all(`🎉 Sync complete.`);
+        } catch (error: any) {
+            this.logger.all(`⚠️ Sync interrupted due to an error: ${error.message}`);
+            await this.updateStateFile(this.localPath, this.stateName, diffs); // Uložíme aktuální stav
+            throw error;
         }
     }
 }

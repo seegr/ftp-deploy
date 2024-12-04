@@ -79,6 +79,17 @@ class MockedLogger implements ILogger {
     verbose() { };
 }
 
+class MockedClient {
+    ftp = { timeout: 10000 };
+    close = jest.fn();
+    access = jest.fn();
+    send = jest.fn().mockResolvedValue(true);
+    uploadFrom = jest.fn();
+    remove = jest.fn();
+    removeDir = jest.fn();
+    ensureDir = jest.fn();
+}
+
 describe("HashDiff", () => {
     const thing = new HashDiff();
     const emptyFileList: IFileList = { version: currentSyncFileVersion, description: "", generatedTime: new Date().getTime(), data: [] };
@@ -266,7 +277,11 @@ describe("FTP sync commands", () => {
             ensureDir() { },
             uploadFrom() { },
         };
-        const syncProvider = new FTPSyncProvider(mockClient as any, mockedLogger, mockedTimings, "local-dir/", "server-dir/", "state-name", false);
+        const syncProvider = new FTPSyncProvider(mockClient as any, mockedLogger, mockedTimings, "local-dir/", "server-dir/", "state-name", false,
+          "server-address", // server
+          "test-user", // username
+          "test-password" // password
+        );
         const spyRemoveFile = jest.spyOn(syncProvider, "uploadFile");
         const mockClientUploadFrom = jest.spyOn(mockClient, "uploadFrom");
         await syncProvider.syncLocalToServer(diffs);
@@ -322,7 +337,11 @@ describe("FTP sync commands", () => {
             remove() { },
             uploadFrom() { },
         };
-        const syncProvider = new FTPSyncProvider(mockClient as any, mockedLogger, mockedTimings, "local-dir/", "server-dir/", "state-name", false);
+        const syncProvider = new FTPSyncProvider(mockClient as any, mockedLogger, mockedTimings, "local-dir/", "server-dir/", "state-name", false,
+          "server-address", // server
+          "test-user", // username
+          "test-password" // password
+        );
         const spyUploadFile = jest.spyOn(syncProvider, "uploadFile");
         const spyRemoveFile = jest.spyOn(syncProvider, "removeFile");
         const mockClientUploadFrom = jest.spyOn(mockClient, "uploadFrom");
@@ -386,7 +405,11 @@ describe("FTP sync commands", () => {
             remove() { },
             uploadFrom() { },
         };
-        const syncProvider = new FTPSyncProvider(mockClient as any, mockedLogger, mockedTimings, "local-dir/", "server-dir/", "state-name", false);
+        const syncProvider = new FTPSyncProvider(mockClient as any, mockedLogger, mockedTimings, "local-dir/", "server-dir/", "state-name", false,
+          "server-address", // server
+          "test-user", // username
+          "test-password" // password
+        );
         const spyUploadFile = jest.spyOn(syncProvider, "uploadFile");
         const mockClientUploadFrom = jest.spyOn(mockClient, "uploadFrom");
         await syncProvider.syncLocalToServer(diffs);
@@ -435,7 +458,11 @@ describe("FTP sync commands", () => {
             remove() { },
             uploadFrom() { },
         };
-        const syncProvider = new FTPSyncProvider(mockClient as any, mockedLogger, mockedTimings, "local-dir/", "server-dir/", "state-name", false);
+        const syncProvider = new FTPSyncProvider(mockClient as any, mockedLogger, mockedTimings, "local-dir/", "server-dir/", "state-name", false,
+          "server-address", // server
+          "test-user", // username
+          "test-password" // password
+        );
         const spyRemoveFile = jest.spyOn(syncProvider, "removeFile");
         const mockClientRemove = jest.spyOn(mockClient, "remove");
         const mockClientUploadFrom = jest.spyOn(mockClient, "uploadFrom");
@@ -493,7 +520,11 @@ describe("FTP sync commands", () => {
             uploadFrom() { },
             cdup() { },
         };
-        const syncProvider = new FTPSyncProvider(mockClient as any, mockedLogger, mockedTimings, "local-dir/", "server-dir/", "state-name", false);
+        const syncProvider = new FTPSyncProvider(mockClient as any, mockedLogger, mockedTimings, "local-dir/", "server-dir/", "state-name", false,
+          "server-address", // server
+          "test-user", // username
+          "test-password" // password
+        );
         const spyRemoveFolder = jest.spyOn(syncProvider, "removeFolder");
         const mockClientRemove = jest.spyOn(mockClient, "remove");
         const mockClientUploadFrom = jest.spyOn(mockClient, "uploadFrom");
@@ -858,7 +889,11 @@ describe("dry-run", () => {
 
         // todo ensureDir
 
-        const syncProvider = new FTPSyncProvider(mockClient as any, mockedLogger, mockedTimings, "local-dir/", "server-dir/", "state-name", true);
+        const syncProvider = new FTPSyncProvider(mockClient as any, mockedLogger, mockedTimings, "local-dir/", "server-dir/", "state-name", true,
+          "server-address", // server
+          "test-user", // username
+          "test-password" // password
+        );
         const spyUploadFile = jest.spyOn(mockClient, "uploadFile");
         const spyRemoveFile = jest.spyOn(mockClient, "removeFile");
         const spyUploadFrom = jest.spyOn(mockClient, "uploadFrom");
@@ -909,4 +944,145 @@ describe("Deploy", () => {
 
         ftpServer.close();
     }, 30000);
+});
+
+describe("FTPSyncProvider reconnect", () => {
+    const mockedLogger = new MockedLogger();
+    const mockedTimings = new Timings();
+
+    test("Reconnect successfully after client closure", async () => {
+        const mockClient = {
+            close: jest.fn(),
+            access: jest.fn(),
+        };
+        const syncProvider = new FTPSyncProvider(
+          mockClient as any,
+          mockedLogger,
+          mockedTimings,
+          "local-dir/",
+          "server-dir/",
+          "state-name",
+          false, // dryRun
+          "server-address", // server
+          "test-user", // username
+          "test-password" // password
+        );
+
+        // Simulace úspěšného připojení
+        mockClient.close.mockImplementation(async () => Promise.resolve());
+        mockClient.access.mockImplementation(async () => Promise.resolve());
+
+        await syncProvider["reconnect"]();
+
+        expect(mockClient.close).toHaveBeenCalledTimes(1);
+        expect(mockClient.access).toHaveBeenCalledTimes(1);
+        expect(mockedLogger.verbose).toHaveBeenCalledWith("Reconnecting to FTP server...");
+        expect(mockedLogger.verbose).toHaveBeenCalledWith("Reconnected successfully.");
+    });
+
+    test("Reconnect is triggered when client is closed", async () => {
+        const mockClient = new MockedClient();
+        const syncProvider = new FTPSyncProvider(
+          mockClient as any,
+          mockedLogger,
+          mockedTimings,
+          "local-dir/",
+          "server-dir/",
+          "state-name",
+          false,
+          "server-address", // server
+          "test-user", // username
+          "test-password" // password
+        );
+
+        const mockOperation = jest.fn().mockImplementation(() => {
+            throw new Error("Client is closed");
+        });
+
+        mockClient.close.mockImplementation(async () => Promise.resolve());
+        mockClient.access.mockImplementation(async () => Promise.resolve());
+
+        await expect(syncProvider["safeOperation"](mockOperation)).rejects.toThrow(
+          "Operation failed after 3 attempts: Client is closed"
+        );
+
+        expect(mockClient.close).toHaveBeenCalledTimes(3); // Při každém pokusu zavřít klienta
+        expect(mockClient.access).toHaveBeenCalledTimes(3); // A znovu připojit
+    });
+
+    test("Reconnect fails after multiple attempts", async () => {
+        const mockClient = new MockedClient();
+        const syncProvider = new FTPSyncProvider(
+          mockClient as any,
+          mockedLogger,
+          mockedTimings,
+          "local-dir/",
+          "server-dir/",
+          "state-name",
+          false,
+          "server-address", // server
+          "test-user", // username
+          "test-password" // password
+        );
+
+        mockClient.close.mockImplementation(async () => Promise.resolve());
+        mockClient.access.mockImplementation(() => {
+            throw new Error("Connection failed");
+        });
+
+        await expect(syncProvider["reconnect"]()).rejects.toThrow("Connection failed");
+
+        expect(mockClient.close).toHaveBeenCalledTimes(1); // Pokus o zavření klienta
+        expect(mockClient.access).toHaveBeenCalledTimes(1); // Pokus o přístup
+        expect(mockedLogger.verbose).toHaveBeenCalledWith("Reconnecting to FTP server...");
+    });
+
+    test("safeOperation retries on failure and succeeds", async () => {
+        const mockClient = new MockedClient();
+        const syncProvider = new FTPSyncProvider(
+          mockClient as any,
+          mockedLogger,
+          mockedTimings,
+          "local-dir/",
+          "server-dir/",
+          "state-name",
+          false,
+          "server-address", // server
+          "test-user", // username
+          "test-password" // password
+        );
+
+        const mockOperation = jest.fn()
+          .mockRejectedValueOnce(new Error("Temporary failure"))
+          .mockResolvedValue("Success");
+
+        const result = await syncProvider["safeOperation"](mockOperation);
+
+        expect(mockOperation).toHaveBeenCalledTimes(2); // Jedno selhání a pak úspěch
+        expect(result).toEqual("Success");
+    });
+
+    test("safeOperation fails after max retries", async () => {
+        const mockClient = new MockedClient();
+        const syncProvider = new FTPSyncProvider(
+          mockClient as any,
+          mockedLogger,
+          mockedTimings,
+          "local-dir/",
+          "server-dir/",
+          "state-name",
+          false,
+          "server-address", // server
+          "test-user", // username
+          "test-password" // password
+        );
+
+        const mockOperation = jest.fn().mockRejectedValue(new Error("Permanent failure"));
+
+        await expect(syncProvider["safeOperation"](mockOperation)).rejects.toThrow(
+          "Operation failed after 3 attempts: Permanent failure"
+        );
+
+        expect(mockOperation).toHaveBeenCalledTimes(3); // Maximální počet pokusů
+    });
 });
